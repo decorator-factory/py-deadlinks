@@ -1,0 +1,16 @@
+[project]
+name = "deadlinks"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aiohttp>=3.11.14",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "hypothesis>=6.130.2",
+    "pytest-asyncio>=0.25.3",
+    "pytest>=8.3.5",
+]
