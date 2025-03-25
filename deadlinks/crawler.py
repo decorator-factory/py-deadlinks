@@ -6,7 +6,7 @@ import re
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import aiohttp
 from yarl import URL
@@ -27,7 +27,7 @@ async def crawl(urls: Iterable[str], config: Config) -> CrawlState:
     state = CrawlState(
         results={},
         warnings={},
-        expected_ids=defaultdict(set),
+        expected_ids=defaultdict(lambda: defaultdict(set)),
         seen_urls={},
     )
 
@@ -55,18 +55,18 @@ async def crawl(urls: Iterable[str], config: Config) -> CrawlState:
 @dataclass(frozen=True, kw_only=True)
 class Config:
     crawlable_pattern: re.Pattern[str]  #
-    max_size_bytes: int = 3*2**20   # 3 MiB
-    crawl_depth: int = 10
+    max_size_bytes: int = 5*2**20   # 5 MiB
+    crawl_depth: int = 3
     max_redirects: int = 4
-    worker_count: int = 4
+    worker_count: int = 8
     request_timeout: float = 5.0
 
 
-@dataclass(repr=False)
+@dataclass(repr=False, kw_only=True)
 class CrawlState:
     results: dict[URL, FetchResult]
     warnings: dict[URL, list[str]]
-    expected_ids: defaultdict[URL, set[str]]
+    expected_ids: defaultdict[URL, defaultdict[str, set[URL]]]  # {url -> {id -> expecters}}
 
     seen_urls: dict[URL, int]  # url -> max level at which the URL was encountered
     # consider this:
@@ -85,14 +85,36 @@ class CrawlState:
             + ">"
         )
 
+    @classmethod
+    def deserialize(cls, obj: Any) -> CrawlState:
+        if obj["v"] != [1, 0]:
+            raise ValueError("Unsupported version")
+
+        # TODO: better validation?
+
+        return CrawlState(
+            results={URL(url): _deserialize_fr(fr) for url, fr in obj["results"].items()},
+            warnings={URL(url): ws for url, ws in obj["warnings"].items()},
+            expected_ids=defaultdict(
+                lambda: defaultdict(set),
+                {
+                    URL(url): defaultdict(set, {
+                        frag: set(map(URL, expecters)) for frag, expecters in fs.items()
+                    }) for url, fs in obj["expected_ids"].items()
+                }
+            ),
+            seen_urls={}, #  TODO?
+        )
+
     def serialize(self) -> dict[str, object]:
         return {
-            "results":
-                {str(url): _serialize_fr(fr) for url, fr in self.results.items()},
-            "warnings":
-                {str(url): ws for url, ws in self.warnings.items()},
-            "expected_fragments":
-                {str(url): list(fs) for url, fs in self.expected_ids.items()}
+            "v": [1, 0],
+            "results": {str(url): _serialize_fr(fr) for url, fr in self.results.items()},
+            "warnings": {str(url): ws for url, ws in self.warnings.items()},
+            "expected_ids": {
+                str(url): {frag: list(map(str, expecters)) for frag, expecters in fs.items()}
+                for url, fs in self.expected_ids.items()
+            }
         }
 
 
@@ -120,6 +142,30 @@ def _serialize_fr(fr: FetchResult) -> dict[str, object]:
 
         case "error", message, detail:
             return {"kind": "error", "message": message, "detail": detail}
+
+
+def _deserialize_fr(obj: Any) -> FetchResult:
+    match obj["kind"]:
+        case "ok":
+            return (
+                "ok",
+                ParseResult(
+                    base_url=obj["base_url"],
+                    http_equiv_redirect=obj["http_equiv_redirect"],
+                    warnings=obj["warnings"],
+                    links=obj["links"],
+                    ids=obj["ids"],
+                )
+            )
+
+        case "redirect":
+            return "redirect", URL("url")
+
+        case "error":
+            return "error", obj["message"], obj["detail"]
+
+        case other:
+            raise ValueError(other)
 
 
 type _QueueItem = (
@@ -213,10 +259,9 @@ def _include_fetch_result(
             elif _should_crawl(base_url, config):
                 for link in html.links:
                     link = base_url.join(URL(link))
-                    if (fragment := link.fragment) is not None:
+                    if fragment := link.fragment:
                         link = link.with_fragment(None)
-                        if fragment != "":
-                            state.expected_ids[link].add(fragment)
+                        state.expected_ids[link][fragment].add(base_url)
 
                     if level + 1 < config.crawl_depth:
                         urls.add(link)
@@ -224,10 +269,9 @@ def _include_fetch_result(
             return [(level + 1, ("crawl", url)) for url in urls]
 
         case "redirect", loc:
-            if (fragment := loc.fragment) is not None:
+            if fragment := loc.fragment:
                 loc = loc.with_fragment(None)
-                if fragment != "":
-                    state.expected_ids[loc].add(fragment)
+                state.expected_ids[loc][fragment].add(base_url)
 
             if redirect_depth + 1 < config.max_redirects:
                 return [(level, ("follow_redirect", redirect_depth + 1, loc))]
@@ -273,6 +317,18 @@ async def _handle_response(
     max_body_size: int,
 ) -> FetchResult:
     if 200 <= resp.status < 300:
+        if "html" not in resp.content_type:
+            return "ok", analyze_page("")
+
+        length = resp.headers.get("content-length")
+        if length is not None:
+            try:
+                n = int(length)
+            except ValueError:
+                return "error", "content-length is not an integer??", {"content-length": length}
+            if n > max_body_size:
+                return "error", "response too large", {}
+
         body = await _safely_read_body(resp, max_body_size)
         if body is None:
             return "error", "response too large", {}
@@ -316,14 +372,88 @@ async def _safely_read_body(resp: aiohttp.ClientResponse, limit: int) -> bytes |
     return b"".join(chunks)
 
 
+
+# Analysis (TODO: move to a separate module)
+
+
+def find_anomalies(state: CrawlState) -> None:
+    errors: dict[URL, tuple[set[URL], object]] = {}  # to -> ({from}, error)
+
+    def _add_error(from_: URL, to: URL, err: object):
+        if to not in errors:
+            errors[to] = (set(), err)
+        errors[to][0].add(from_)
+
+    for base_url, result in state.results.items():
+        match result:
+            case "ok", html:
+                for link in html.links:
+                    abs_url = base_url.join(URL(link)).with_fragment(None)
+                    res = _resolve_page(state, abs_url)
+                    if res[0] not in {"ok", "out_of_scope"}:
+                        _add_error(base_url, abs_url, res)
+
+    for url, (refs, err) in errors.items():
+        print(f"{url} referenced from {len(refs)} pages: {err}")
+
+    for base_url, result in state.results.items():
+        match result:
+            case "ok", html:
+                expected_ids = state.expected_ids.get(base_url, defaultdict(set))
+                if diff := expected_ids.keys() - html.ids:
+                    print(f"Ids missing from {base_url}:")
+                    for id_ in diff:
+                        print(f"- {id_} from: ")
+                        for ref in expected_ids[id_]:
+                            print(f"  .  {ref}")
+                    print()
+
+
+def _resolve_page(state: CrawlState, url: URL) -> (
+    tuple[Literal["ok"], ParseResult]
+    | tuple[Literal["out_of_scope"]]
+    | tuple[Literal["error"], str, dict[str, object]]
+):
+    seen: set[URL] = set()
+    while True:
+        url = url.with_fragment(None)
+        seen.add(url)
+        match state.results.get(url):
+            case None:
+                return "out_of_scope",  # didn't get that far when crawling
+
+            case "ok", html:
+                return "ok", html
+
+            case "redirect", url:
+                url = url.with_fragment(None)
+                if url in seen:
+                    return "error", "too many redirects", {"chain": list(map(str, seen))}
+
+            case "error", err, detail:
+                return "error", err, detail
+
+
 if __name__ == "__main__":
-    urls = [
-        "https://decorator-factory.github.io/typing-tips",
-    ]
-    crawl_state = asyncio.run(
-        crawl(urls, Config(
-            crawlable_pattern = re.compile(r"https?://decorator-factory\.github\.io($|/.*)")
-        ))
-    )
-    with open(".crawl.json", "w") as file:
-        json.dump(crawl_state.serialize(), file, indent=2, ensure_ascii=False)
+    stage = "crawl"
+
+    match stage:
+        case "crawl":
+            urls = [
+                "https://decorator-factory.github.io/typing-tips",
+            ]
+            crawl_state = asyncio.run(
+                crawl(urls, Config(
+                    crawlable_pattern = re.compile(r"https?://decorator-factory\.github\.io($|/.*)")
+                ))
+            )
+            with open(".crawl2.json", "w") as file:
+                json.dump(crawl_state.serialize(), file, indent=2, ensure_ascii=False)
+
+        case "analyze":
+            with open(".crawl2.json") as file:
+                j = json.load(file)
+            state = CrawlState.deserialize(j)
+            print(state)
+            find_anomalies(state)
+
