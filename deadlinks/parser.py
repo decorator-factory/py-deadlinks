@@ -59,6 +59,7 @@ class _Parser(HTMLParser):
                     if name == "href" and value is not None:
                         self._base_url = value
                         break
+
         elif tag == "a":
             # https://developer.mozilla.org/en-US/docs/Web/HTML/Element/a#href
             for name, value in attrs:
@@ -82,7 +83,3 @@ class _Parser(HTMLParser):
                     self._warnings.append(
                         f"Invalid http-equiv=refresh meta tag around pos={len(self.rawdata)}")
 
-
-
-
-    handle_startendtags = override(handle_starttag)
